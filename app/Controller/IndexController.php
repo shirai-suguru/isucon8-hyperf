@@ -19,10 +19,12 @@ use Hyperf\View\RenderInterface;
 use Hyperf\HttpServer\Annotation\Middleware;
 use Hyperf\HttpServer\Annotation\RequestMapping;
 use Hyperf\HttpServer\Annotation\Controller;
+use Hyperf\HttpMessage\Stream\SwooleStream;
 use Psr\Http\Message\ResponseInterface as Response;
 use App\Middleware\AdminLoginRequiredMiddleware;
 use App\Middleware\LoginRequiredMiddleware;
 use App\Service\UserService;
+use Hyperf\Logger\LoggerFactory;
 
 /**
  * @Controller()
@@ -42,9 +44,19 @@ class IndexController extends AbstractController
      */
     private $session;
 
+    /**
+     * @var \Psr\Log\LoggerInterface
+     */
+    protected $logger;
+
+    public function __construct(LoggerFactory $loggerFactory)
+    {
+        $this->logger = $loggerFactory->get('default');
+    }
+
     private function validate_rank($rank)
     {
-        return (int) Db::select('SELECT COUNT(*) AS `CNT` FROM sheets WHERE `rank` = ?', [$rank])[0]['CNT'] ?? 0;
+        return (int) Db::select('SELECT COUNT(*) AS `CNT` FROM sheets WHERE `rank` = ?', [$rank])[0]->CNT ?? 0;
     }
 
     private function sanitize_event(array $event): array
@@ -58,22 +70,21 @@ class IndexController extends AbstractController
     
     private function res_error(ResponseInterface $response, string $error = 'unknown', int $status = 500): Response
     {
-        return $response->json(['error' => $error], $status);
+        return $this->response->withStatus($status)->withHeader('Content-Type', 'application/json')->withBody(new SwooleStream(json_encode(['error' => $error])));
     }
 
     private function get_events(?callable $where = null): array
     {
         if (null === $where) {
-            $where = function (array $event) {
-                return $event['public_fg'];
+            $where = function ($event) {
+                return $event->public_fg;
             };
         }
     
-        // Db::beginTransaction();
         try {
             $events = [];
-            $event_ids = array_map(function (array $event) {
-                return $event['id'];
+            $event_ids = array_map(function ($event) {
+                return $event->id;
             }, array_filter(Db::select('SELECT * FROM events ORDER BY id ASC'), $where));
     
             foreach ($event_ids as $event_id) {
@@ -86,10 +97,9 @@ class IndexController extends AbstractController
                 array_push($events, $event);
             }
         } catch (\Throwable $e) {
-            // Db::rollback();
+            $this->logger->info('error');
         }
-        // Db::commit();
-
+        
         return $events;
     }
     private function get_event(int $event_id, ?int $login_user_id = null): array
@@ -101,54 +111,58 @@ class IndexController extends AbstractController
             return [];
         }
     
-        $event['id'] = (int) $event['id'];
+        $retEvents['id'] = (int) $event->id;
+        $retEvents['title'] = $event->title;
+        $retEvents['price'] = $event->price;
     
         // zero fill
-        $event['total'] = 0;
-        $event['remains'] = 0;
+        $retEvents['total'] = 0;
+        $retEvents['remains'] = 0;
     
         foreach (['S', 'A', 'B', 'C'] as $rank) {
-            $event['sheets'][$rank]['total'] = 0;
-            $event['sheets'][$rank]['remains'] = 0;
+            $retEvents['sheets'][$rank]['total'] = 0;
+            $retEvents['sheets'][$rank]['remains'] = 0;
         }
     
         $sheets = Db::select('SELECT * FROM sheets ORDER BY `rank`, num');
 
         foreach ($sheets as $sheet) {
-            $event['sheets'][$sheet['rank']]['price'] = $event['sheet'][$sheet['rank']]['price'] ?? $event['price'] + $sheet['price'];
+            $retSheets = [];
+            $retEvents['sheets'][$sheet->rank]['price'] = $retEvents['sheet'][$sheet->rank]['price'] ?? $event->price + $sheet->price;
     
-            ++$event['total'];
-            ++$event['sheets'][$sheet['rank']]['total'];
+            ++$retEvents['total'];
+            ++$retEvents['sheets'][$sheet->rank]['total'];
     
-            $reservation =  Db::select('SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)', [$event['id'], $sheet['id']])[0] ?? null;
+            $reservation =  Db::select('SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)', [$retEvents['id'], $sheet->id])[0] ?? null;
+
             if ($reservation) {
-                $sheet['mine'] = $login_user_id && $reservation['user_id'] == $login_user_id;
-                $sheet['reserved'] = true;
-                $sheet['reserved_at'] = (new \DateTime("{$reservation['reserved_at']}", new \DateTimeZone('UTC')))->getTimestamp();
+                $retSheets['mine'] = $login_user_id && $reservation->user_id == $login_user_id;
+                $retSheets['reserved'] = true;
+                $retSheets['reserved_at'] = (new \DateTime("{$reservation->reserved_at}", new \DateTimeZone('UTC')))->getTimestamp();
             } else {
-                ++$event['remains'];
-                ++$event['sheets'][$sheet['rank']]['remains'];
+                ++$retEvents['remains'];
+                ++$retEvents['sheets'][$sheet->rank]['remains'];
             }
 
-            $sheet['num'] = $sheet['num'];
-            $rank = $sheet['rank'];
-            unset($sheet['id']);
-            unset($sheet['price']);
-            unset($sheet['rank']);
+            $retSheets['num'] = $sheet->num;
+            $rank = $sheet->rank;
+            unset($retSheets['id']);
+            unset($retSheets['price']);
+            unset($retSheets['rank']);
     
-            if (false === isset($event['sheets'][$rank]['detail'])) {
-                $event['sheets'][$rank]['detail'] = [];
+            if (false === isset($retEvents['sheets'][$rank]['detail'])) {
+                $retEvents['sheets'][$rank]['detail'] = [];
             }
-            array_push($event['sheets'][$rank]['detail'], $sheet);
+            array_push($retEvents['sheets'][$rank]['detail'], $retSheets);
         }
     
-        $event['public'] = $event['public_fg'] ? true : false;
-        $event['closed'] = $event['closed_fg'] ? true : false;
+        $retEvents['public'] = $event->public_fg ? true : false;
+        $retEvents['closed'] = $event->closed_fg ? true : false;
     
-        unset($event['public_fg']);
-        unset($event['closed_fg']);
+        unset($retEvents['public_fg']);
+        unset($retEvents['closed_fg']);
     
-        return $event;
+        return $retEvents;
     }
     
     /**
@@ -205,7 +219,7 @@ class IndexController extends AbstractController
         Db::beginTransaction();
         try {
             Db::insert('INSERT INTO users (login_name, pass_hash, nickname) VALUES (?, SHA2(?, 256), ?)', [$login_name, $password, $nickname]);
-            $user_id = Db::select('SELECT last_insert_id() as user_id')[0]['user_id'];
+            $user_id = Db::select('SELECT last_insert_id() as user_id')[0]->user_id;
             Db::commit();
         } catch (\Throwable $throwable) {
             Db::rollback();
@@ -213,10 +227,11 @@ class IndexController extends AbstractController
             return $this->res_error($this->response);
         }
     
-        return $this->response->json([
+        return $this->response->withStatus(201)->withHeader('Content-Type', 'application/json')->withBody(new SwooleStream(json_encode([
             'id' => (int)$user_id,
             'nickname' => $nickname,
-        ], 201, JSON_NUMERIC_CHECK);
+        ])));
+
     }
 
     /**
@@ -228,33 +243,32 @@ class IndexController extends AbstractController
     public function apiUsersById(int $id): Response
     {
         $user = Db::select('SELECT id, nickname FROM users WHERE id = ?', [$id])[0];
-        $user['id'] = (int) $user['id'];
-        if (!$user || $user['id'] !== $this->userService->getLoginUser()['id']) {
+        if (!$user || $user->id !== $this->userService->getLoginUser()->id) {
             return $this->res_error($this->response, 'forbidden', 403);
         }
-    
+
         $recent_reservations = function () use ($user) {
             $recent_reservations = [];
     
-            $rows = Db::select('SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id WHERE r.user_id = ? ORDER BY IFNULL(r.canceled_at, r.reserved_at) DESC LIMIT 5', [$user['id']]);
+            $rows = Db::select('SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id WHERE r.user_id = ? ORDER BY IFNULL(r.canceled_at, r.reserved_at) DESC LIMIT 5', [$user->id]);
             foreach ($rows as $row) {
-                $event = $this->get_event($row['event_id']);
-                $price = $event['sheets'][$row['sheet_rank']]['price'];
+                $event = $this->get_event($row->event_id);
+                $price = $event['sheets'][$row->sheet_rank]['price'];
                 unset($event['sheets']);
                 unset($event['total']);
                 unset($event['remains']);
     
                 $reservation = [
-                    'id' => $row['id'],
+                    'id' => $row->id,
                     'event' => $event,
-                    'sheet_rank' => $row['sheet_rank'],
-                    'sheet_num' => $row['sheet_num'],
+                    'sheet_rank' => $row->sheet_rank,
+                    'sheet_num' => $row->sheet_num,
                     'price' => $price,
-                    'reserved_at' => (new \DateTime("{$row['reserved_at']}", new \DateTimeZone('UTC')))->getTimestamp(),
+                    'reserved_at' => (new \DateTime("{$row->reserved_at}", new \DateTimeZone('UTC')))->getTimestamp(),
                 ];
     
-                if ($row['canceled_at']) {
-                    $reservation['canceled_at'] = (new \DateTime("{$row['canceled_at']}", new \DateTimeZone('UTC')))->getTimestamp();
+                if ($row->canceled_at) {
+                    $reservation['canceled_at'] = (new \DateTime("{$row->canceled_at}", new \DateTimeZone('UTC')))->getTimestamp();
                 }
     
                 array_push($recent_reservations, $reservation);
@@ -263,15 +277,20 @@ class IndexController extends AbstractController
             return $recent_reservations;
         };
     
-        $user['recent_reservations'] = $recent_reservations($this);
-        $user['total_price'] = Db::select('SELECT IFNULL(SUM(e.price + s.price), 0) AS `total_price` FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.user_id = ? AND r.canceled_at IS NULL', [$user['id']])[0]['total_price'];
+        $retUser = [];
+        $retUser['id'] = $user->id;
+        $retUser['nickname'] = $user->nickname;
+        
+        $retUser['recent_reservations'] = $recent_reservations($this);
+        $retUser['total_price'] = (int) Db::select('SELECT IFNULL(SUM(e.price + s.price), 0) AS `total_price` FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.user_id = ? AND r.canceled_at IS NULL', [$user->id])[0]->total_price;
     
         $recent_events = function () use ($user) {
             $recent_events = [];
+
     
-            $rows = Db::select('SELECT event_id FROM reservations WHERE user_id = ? GROUP BY event_id ORDER BY MAX(IFNULL(canceled_at, reserved_at)) DESC LIMIT 5', [$user['id']]);
+            $rows = Db::select('SELECT event_id FROM reservations WHERE user_id = ? GROUP BY event_id ORDER BY MAX(IFNULL(canceled_at, reserved_at)) DESC LIMIT 5', [$user->id]);
             foreach ($rows as $row) {
-                $event = $this->get_event($row['event_id']);
+                $event = $this->get_event($row->event_id);
                 foreach (array_keys($event['sheets']) as $rank) {
                     unset($event['sheets'][$rank]['detail']);
                 }
@@ -281,9 +300,9 @@ class IndexController extends AbstractController
             return $recent_events;
         };
     
-        $user['recent_events'] = $recent_events($this);
+        $retUser['recent_events'] = $recent_events($this);
     
-        return $this->response->json($user, 200, JSON_NUMERIC_CHECK);
+        return $this->response->json($retUser);
     }
 
     /**
@@ -292,21 +311,22 @@ class IndexController extends AbstractController
      */
     public function login(): Response
     {
+
         $login_name = $this->request->input('login_name');
         $password = $this->request->input('password');
     
         $user = Db::select('SELECT * FROM users WHERE login_name = ?', [$login_name]);
-        $pass_hash = Db::select('SELECT SHA2(?, 256) AS `hash`', [$password])[0]['hash'];
+        $pass_hash = Db::select('SELECT SHA2(?, 256) AS `hash`', [$password])[0]->hash;
     
-        if (!$user || $pass_hash != $user[0]['pass_hash']) {
+        if (!$user || $pass_hash != $user[0]->pass_hash) {
             return $this->res_error($this->response, 'authentication_failed', 401);
         }
     
-        $this->session->set('user_id', (int)$user[0]['id']);
+        $this->session->set('user_id', (int)$user[0]->id);
     
         $user = $this->userService->getLoginUser();
     
-        return $this->response->json($user, 200, JSON_NUMERIC_CHECK);
+        return $this->response->json($user);
     }
 
     /**
@@ -331,7 +351,7 @@ class IndexController extends AbstractController
             return $this->sanitize_event($event);
         }, $this->get_events());
     
-        return $this->response->json($events, 200, JSON_NUMERIC_CHECK);
+        return $this->response->json($events);
     }
 
     /**
@@ -343,7 +363,12 @@ class IndexController extends AbstractController
     {
         $event_id = $id;
         $user = $this->userService->getLoginUser();
-        $event = $this->get_event($event_id, $user['id']);
+
+        if ($user) {
+            $event = $this->get_event($event_id, $user->id);
+        } else {
+            $event = $this->get_event($event_id);
+        }
     
         if (empty($event) || !$event['public']) {
             return $this->res_error($this->response, 'not_found', 404);
@@ -351,7 +376,7 @@ class IndexController extends AbstractController
     
         $event = $this->sanitize_event($event);
     
-        return $this->response->json($event, 200, JSON_NUMERIC_CHECK);
+        return $this->response->json($event);
     }
 
 
@@ -367,7 +392,7 @@ class IndexController extends AbstractController
         $rank = $this->request->input('sheet_rank');
     
         $user = $this->userService->getLoginUser();
-        $event = $this->get_event($event_id, $user['id']);
+        $event = $this->get_event($event_id, $user->id);
     
         if (empty($event) || !$event['public']) {
             return $this->res_error($this->response, 'invalid_event', 404);
@@ -387,9 +412,9 @@ class IndexController extends AbstractController
     
             Db::beginTransaction();
             try {
-                Db::insert('INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)', [$event['id'], $sheet[0]['id'], $user['id'], (new \DateTime('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s.u')]);
-                $result = Db::select('SELECT last_insert_id() AS `id`');
-                $reservation_id = $result[0]['id'];
+                Db::insert('INSERT INTO reservations (event_id, sheet_id, user_id, reserved_at) VALUES (?, ?, ?, ?)', [$event['id'], $sheet[0]->id, $user->id, (new \DateTime('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s.u')]);
+                $result = Db::select('SELECT last_insert_id() AS `id`')[0];
+                $reservation_id = $result->id;
     
                 Db::commit();
             } catch (\Exception $e) {
@@ -399,13 +424,11 @@ class IndexController extends AbstractController
     
             break;
         }
-
-        return $this->response->json([
+        return $this->response->withStatus(202)->withHeader('Content-Type', 'application/json')->withBody(new SwooleStream(json_encode([
             'id' => $reservation_id,
             'sheet_rank' => $rank,
-            'sheet_num' => $sheet[0]['num'],
-        ], 202, JSON_NUMERIC_CHECK);
-    
+            'sheet_num' => $sheet[0]->num,
+        ])));    
     }
 
     /**
@@ -423,7 +446,7 @@ class IndexController extends AbstractController
         $num = $num;
     
         $user = $this->userService->getLoginUser();
-        $event = $this->get_event($event_id, $user['id']);
+        $event = $this->get_event($event_id, $user->id);
     
         if (empty($event) || !$event['public']) {
             return $this->res_error($this->response, 'invalid_event', 404);
@@ -438,23 +461,19 @@ class IndexController extends AbstractController
             return $this->res_error($this->response, 'invalid_sheet', 404);
         }
 
-        $reservation = Db::select('SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id HAVING reserved_at = MIN(reserved_at) FOR UPDATE', [$event['id'], $sheet[0]['id']]);
+        $reservation = Db::select('SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id HAVING reserved_at = MIN(reserved_at) FOR UPDATE', [$event['id'], $sheet[0]->id]);
         if (!$reservation) {
-            // Db::rollback();
-
             return $this->res_error($this->response, 'not_reserved', 400);
         }
 
-        if ($reservation[0]['user_id'] != $user['id']) {
-            // Db::rollback();
-
+        if ($reservation[0]->user_id != $user->id) {
             return $this->res_error($this->response, 'not_permitted', 403);
         }
 
         Db::beginTransaction();
         try {
         
-            Db::update('UPDATE reservations SET canceled_at = ? WHERE id = ?', [(new \DateTime('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s.u'), $reservation[0]['id']]);
+            Db::update('UPDATE reservations SET canceled_at = ? WHERE id = ?', [(new \DateTime('now', new \DateTimeZone('UTC')))->format('Y-m-d H:i:s.u'), $reservation[0]->id]);
             Db::commit();
         } catch (\Exception $e) {
             Db::rollback();
@@ -467,7 +486,7 @@ class IndexController extends AbstractController
 
 
     /**
-     * @RequestMapping("/admin")
+     * @RequestMapping("/admin/")
      * @return Response
      */
     public function admin(): Response
@@ -496,15 +515,15 @@ class IndexController extends AbstractController
         $password = $this->request->input('password');
     
         $administrator = Db::select('SELECT * FROM administrators WHERE login_name = ?', [$login_name]);
-        $pass_hash = Db::select('SELECT SHA2(?, 256) AS `hash`', [$password])[0]['hash'];
+        $pass_hash = Db::select('SELECT SHA2(?, 256) AS `hash`', [$password])[0]->hash;
     
-        if (!$administrator || $pass_hash != $administrator[0]['pass_hash']) {
+        if (!$administrator || $pass_hash != $administrator[0]->pass_hash) {
             return $this->res_error($this->response, 'authentication_failed', 401);
         }
         
-        $this->session->set('administrator_id', (int)$administrator[0]['id']);
-        
-        return $this->response->json($administrator[0], 200, JSON_NUMERIC_CHECK);
+        $this->session->set('administrator_id', (int)$administrator[0]->id);
+
+        return $this->response->json($administrator[0]);
     }
 
     /**
@@ -528,7 +547,7 @@ class IndexController extends AbstractController
     {
         $events = $this->get_events(function ($event) { return $event; });
     
-        return $this->response->json($events, 200, JSON_NUMERIC_CHECK);
+        return $this->response->json($events);
     }
 
     /**
@@ -548,7 +567,7 @@ class IndexController extends AbstractController
         try {
             Db::insert('INSERT INTO events (title, public_fg, closed_fg, price) VALUES (?, ?, 0, ?)', [$title, $public, $price]);
             $result = Db::select('SELECT last_insert_id() AS `id`');
-            $event_id = $result[0]['id'];
+            $event_id = $result[0]->id;
             Db::commit();
         } catch (\Exception $e) {
             Db::rollback();
@@ -556,7 +575,7 @@ class IndexController extends AbstractController
     
         $event = $this->get_event($event_id);
     
-        return $this->response->json($event, 200, JSON_NUMERIC_CHECK);
+        return $this->response->json($event);
     }
 
     /**
@@ -574,7 +593,7 @@ class IndexController extends AbstractController
             return $this->res_error($this->response, 'not_found', 404);
         }
     
-        return $this->response->json($event, 200, JSON_NUMERIC_CHECK);
+        return $this->response->json($event);
     }
 
     /**
@@ -613,7 +632,7 @@ class IndexController extends AbstractController
         }
         $event = $this->get_event($event_id);
     
-        return $this->response->json($event, 200, JSON_NUMERIC_CHECK);
+        return $this->response->json($event);
     }
 
     /**
@@ -631,14 +650,14 @@ class IndexController extends AbstractController
         $reservations = Db::select('SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id WHERE r.event_id = ? ORDER BY reserved_at ASC FOR UPDATE', [$event['id']]);
         foreach ($reservations as $reservation) {
             $report = [
-                'reservation_id' => $reservation['id'],
-                'event_id' => $reservation['event_id'],
-                'rank' => $reservation['sheet_rank'],
-                'num' => $reservation['sheet_num'],
-                'user_id' => $reservation['user_id'],
-                'sold_at' => (new \DateTime("{$reservation['reserved_at']}", new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u').'Z',
-                'canceled_at' => $reservation['canceled_at'] ? (new \DateTime("{$reservation['canceled_at']}", new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u').'Z' : '',
-                'price' => $reservation['event_price'] + $reservation['sheet_price'],
+                'reservation_id' => $reservation->id,
+                'event_id' => $reservation->event_id,
+                'rank' => $reservation->sheet_rank,
+                'num' => $reservation->sheet_num,
+                'user_id' => $reservation->user_id,
+                'sold_at' => (new \DateTime("{$reservation->reserved_at}", new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u').'Z',
+                'canceled_at' => $reservation->canceled_at ? (new \DateTime("{$reservation->canceled_at}", new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u').'Z' : '',
+                'price' => $reservation->event_price + $reservation->sheet_price,
             ];
     
             array_push($reports, $report);
@@ -658,14 +677,14 @@ class IndexController extends AbstractController
         $reservations = Db::select('SELECT r.*, s.rank AS sheet_rank, s.num AS sheet_num, s.price AS sheet_price, e.id AS event_id, e.price AS event_price FROM reservations r INNER JOIN sheets s ON s.id = r.sheet_id INNER JOIN events e ON e.id = r.event_id ORDER BY reserved_at ASC FOR UPDATE');
         foreach ($reservations as $reservation) {
             $report = [
-                'reservation_id' => $reservation['id'],
-                'event_id' => $reservation['event_id'],
-                'rank' => $reservation['sheet_rank'],
-                'num' => $reservation['sheet_num'],
-                'user_id' => $reservation['user_id'],
-                'sold_at' => (new \DateTime("{$reservation['reserved_at']}", new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u').'Z',
-                'canceled_at' => $reservation['canceled_at'] ? (new \DateTime("{$reservation['canceled_at']}", new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u').'Z' : '',
-                'price' => $reservation['event_price'] + $reservation['sheet_price'],
+                'reservation_id' => $reservation->id,
+                'event_id' => $reservation->event_id,
+                'rank' => $reservation->sheet_rank,
+                'num' => $reservation->sheet_num,
+                'user_id' => $reservation->user_id,
+                'sold_at' => (new \DateTime("{$reservation->reserved_at}", new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u').'Z',
+                'canceled_at' => $reservation->canceled_at ? (new \DateTime("{$reservation->canceled_at}", new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u').'Z' : '',
+                'price' => $reservation->event_price + $reservation->sheet_price,
             ];
     
             array_push($reports, $report);

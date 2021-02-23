@@ -23,7 +23,6 @@ class UserService
         }
 
         $user = Db::select('SELECT id, nickname FROM users WHERE id = ?', [$user_id])[0] ?? null;
-        $user['id'] = (int) $user['id'];
         return $user;
     }
 
@@ -35,7 +34,6 @@ class UserService
         }
 
         $administrator = Db::select('SELECT id, nickname FROM administrators WHERE id = ?', [$administrator_id])[0] ?? null;
-        $administrator['id'] = (int) $administrator['id'];
         return $administrator;
     }
 }
